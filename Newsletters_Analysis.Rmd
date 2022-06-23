@@ -1,0 +1,382 @@
+---
+title: "Newsletter Email Analysis"
+author: "Katherine Liu, Yitian Fu"
+date: "3/1/2022"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Read and explore the data 
+```{r}
+ns_data <- 
+  read.csv(
+    "newsletters.csv", 
+    header = TRUE, 
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+    )
+```
+
+```{r}
+dim(ns_data)
+```
+
+```{r}
+library(kableExtra)
+library(tibble)
+codebook <- 
+  tibble(
+    VARIABLES = c("ts", "nl_id", "user_id", "dt", "hr", "event_type", "event_type_param"),
+    DESCRIPTION = c("timestamp (epoch time in seconds)", "Identifier for each user", "This is the id of the houzz email newsletters. It is unique at the newsletter batch level, not user level.", "date", "hour", "there are 3 types: ▪	nlsent: a newsletter email was sent
+▪	nlpv: a newsletter email was viewed
+▪	nllc: newsletter link clicks (user clicked on clickable content in the newsletter and was directed to relevant content on the Houzz website)
+", "extra parameters for newsletter link positions. Each newsletter contains multiple sale banners.▪	g0: clicks on the first sale banner in the newsletter
+▪	g1: clicks on the the 2nd sale banner in the newsletter
+▪	g2: clicks on the the 3rd sale banner in the newsletter
+")
+    
+  )
+
+knitr::kable(codebook, caption = "About this dataset") %>% kable_styling(bootstrap_options = "striped" ,font_size = 20) %>% kableExtra::scroll_box(width = "100%", height = "500px")
+```
+
+```{r}
+# add a combined ID
+library("stringr")
+ns_data$combine_id<-str_c(as.character(ns_data$nl_id),",",as.character(ns_data$user_id))
+ns_data$user_id<-as.factor(ns_data$user_id)
+ns_data$event_type<-as.factor(ns_data$event_type)
+head(ns_data)
+```
+## check whether there are missing values
+
+```{r}
+sum(is.na(ns_data))
+```
+
+There is no missing value.
+
+## check incorrect data
+
+```{r}
+summary(ns_data$ts)
+```
+```{r}
+sum(ns_data$ts==0)
+```
+
+The timestamp should not be 0, so delete them.
+
+```{r warning=FALSE, message=FALSE}
+library(tidyverse)
+error_ts<-ns_data%>%filter(ts==0)
+table1<-as.data.frame(error_ts$combine_id)
+# find the data which has 0 for ds and then use sql to delete
+library(sqldf)
+ns_data_new<-sqldf("
+             SELECT * FROM ns_data 
+             where combine_id not in table1")
+
+```
+
+```{r}
+summary(ns_data_new$ts)
+```
+
+# Sanity Checking rules:
+
+## - The same email should be sent to the same user only once.
+
+```{r}
+ns_sent<- ns_data_new[which(ns_data_new$event_type=="nlsent"),]
+count_com_id<-sqldf("SELECT COUNT(combine_id) FROM ns_sent GROUP BY combine_id")
+sum(count_com_id!=1)
+```
+
+There is no violation of this rule. 
+
+## - An email can only be viewed once it was sent. 
+
+check whether sent records and viewed records matched，eg：not sent but viewed
+
+```{r}
+ns_viewed<-ns_data_new[which(ns_data_new$event_type=="nlpv"),]
+violation1<-sqldf("SELECT v.combine_id 
+            FROM  ns_viewed v 
+            LEFT JOIN ns_sent s ON s.nl_id=v.nl_id AND s.user_id=v.user_id 
+            WHERE s.user_id IS NULL")
+
+ns_data_new<-sqldf("
+             SELECT * FROM ns_data_new 
+             where combine_id not in violation1")
+```
+
+
+## - An email should be sent to a user before it is viewed.
+
+timestamp of view should less than the timestamp of sent
+
+```{r}
+violation2<-sqldf("SELECT v.nl_id, v.user_id, v.ts as view_time, 
+            s.ts as sent_time, (v.ts-s.ts) as time_diff, v.combine_id
+            FROM ns_viewed v 
+            LEFT JOIN ns_sent s 
+           ON v.user_id=s.user_id AND v.nl_id=s.nl_id 
+           WHERE v.ts<s.ts")
+violation2_1<-sqldf("SELECT combine_id FROM violation2")
+```
+
+```{r}
+ns_data_new<-sqldf("
+             SELECT * FROM ns_data_new 
+             where combine_id not in violation2_1")
+```
+
+There were 27 records where the newsletter was viewed before it was sent, so deltet them.
+
+## - An email can only be clicked on once it was viewed. 
+
+```{r}
+ns_clicked<-ns_data_new[which(ns_data_new$event_type=="nllc"),]
+
+violation3<-sqldf("SELECT c.combine_id 
+            FROM  ns_clicked c 
+            LEFT JOIN ns_viewed v ON c.nl_id=v.nl_id AND c.user_id=v.user_id 
+            WHERE v.user_id IS NULL")
+
+ns_data_new<-sqldf("
+             SELECT * FROM ns_data_new 
+             where combine_id not in violation3")
+```
+
+
+## - An email should be viewed by a user before it is clicked on. 
+
+There are multiple views for the same user.
+
+```{r}
+view_earliest<-sqldf("SELECT * 
+                     FROM ns_data_new 
+                     WHERE event_type='nlpv' 
+                     GROUP BY nl_id, user_id 
+                     HAVING min(ts)")
+
+click_earliest<-sqldf("SELECT * 
+                      FROM ns_data_new 
+                      WHERE event_type='nllc' 
+                      GROUP BY nl_id, user_id 
+                      HAVING min(ts)")
+click_earliest
+```
+
+```{r}
+violation4 <- sqldf("SELECT v.nl_id, v.user_id, c.ts as click_time, v.ts as view_time, (c.ts-v.ts) as time_diff, c.combine_id 
+              FROM click_earliest c 
+              LEFT JOIN view_earliest v 
+                ON c.nl_id=v.nl_id AND c.user_id=v.user_id 
+              WHERE v.ts>c.ts ORDER BY time_diff")
+
+violation4_1<-sqldf("select combine_id from violation4")
+ns_data_new<-sqldf("
+             SELECT * FROM ns_data_new 
+             where combine_id not in violation4_1")
+```
+
+# Analysis
+
+## 1.	How many newsletters were sent vs. opened for nl_id 2885 and 2912? What’s the overall open rate for each newsletter?  
+
+```{r}
+nl_id_2885 <- ns_data_new[which(ns_data_new$nl_id==2885),] 
+nl_id_2912 <- ns_data_new[which(ns_data_new$nl_id==2912),] 
+```
+
+Define the open rate = # unique users who opened a newsletter / # unique users who received a newsletter.
+
+```{r}
+open_2885<- sqldf("select * from nl_id_2885 where event_type='nlpv' group by user_id having min(ts)")
+sent_2885<- sqldf("select * from nl_id_2885 where event_type='nlsent' order by user_id")
+open_rate_2885<-nrow(open_2885)/nrow(sent_2885)
+open_rate_2885
+```
+
+```{r}
+open_2912<-sqldf("select * from nl_id_2912 where event_type='nlpv' group by combine_id having min(ts)")
+sent_2912<- sqldf("select * from nl_id_2912 where event_type='nlsent'")
+open_rate_2912<-nrow(open_2912)/nrow(sent_2912)
+open_rate_2912
+```
+
+## 2.	What % of users opened the email within 1, 2, 3, 4, 5, 6, 7 days? Visualize the results for each newsletter. Which newsletter has the best open_rate?
+```{r}
+nl_id_2885 <- ns_data_new[which(ns_data_new$nl_id==2885),] 
+nl_id_2912 <- ns_data_new[which(ns_data_new$nl_id==2912),] 
+nl_id_2853 <- ns_data_new[which(ns_data_new$nl_id==2853),] 
+nl_id_2873 <- ns_data_new[which(ns_data_new$nl_id==2873),] 
+```
+
+```{r}
+nl_id_2885 <- ns_data_new[which(ns_data_new$nl_id==2885),]
+sent_2885<- sqldf("select * from nl_id_2885 where event_type='nlsent' order by user_id")
+open_2885<- sqldf("select * from nl_id_2885 where event_type='nlpv' order by user_id")
+
+sent_open_join_2885<-sqldf("select s.user_id, s.ts sent_ts, o.ts open_ts from sent_2885 s left join open_2885 o on s.user_id=o.user_id where o.ts is not null")
+
+sent_open_table_2885<-sqldf("select user_id,sent_ts,min(open_ts) open_ts from sent_open_join_2885 group by user_id order by open_ts")
+
+open_rate_2885<-matrix(NA, ncol=7, nrow=1)
+for (i in 1:7){
+  #24h=24*60*60=86400seconds
+  day_seconds<-86400*i
+  nums_open_2885<-sent_open_table_2885%>%filter(open_ts-sent_ts<=day_seconds)
+  open_rate_2885[,i]<-nrow(nums_open_2885)/nrow(sent_2885)
+  
+}
+open_rate_2885
+```
+
+```{r}
+nl_id_2912 <- ns_data_new[which(ns_data_new$nl_id==2912),]
+sent_2912<- sqldf("select * from nl_id_2912 where event_type='nlsent' order by user_id")
+open_2912<- sqldf("select * from nl_id_2912 where event_type='nlpv' order by user_id")
+
+sent_open_join_2912<-sqldf("select s.user_id, s.ts sent_ts, o.ts open_ts from sent_2912 s left join open_2912 o on s.user_id=o.user_id where o.ts is not null")
+
+sent_open_table_2912<-sqldf("select user_id,sent_ts,min(open_ts) open_ts from sent_open_join_2912 group by user_id order by open_ts")
+
+open_rate_2912<-matrix(NA, ncol=7, nrow=1)
+for (i in 1:7){
+  day_seconds<-86400*i
+  nums_open_2912<-sent_open_table_2912%>%filter(open_ts-sent_ts<=day_seconds)
+  open_rate_2912[,i]<-nrow(nums_open_2912)/nrow(sent_2912)
+  
+}
+open_rate_2912
+```
+
+```{r}
+nl_id_2853 <- ns_data_new[which(ns_data_new$nl_id==2853),]
+sent_2853<- sqldf("select * from nl_id_2853 where event_type='nlsent' order by user_id")
+open_2853<- sqldf("select * from nl_id_2853 where event_type='nlpv' order by user_id")
+
+sent_open_join_2853<-sqldf("select s.user_id, s.ts sent_ts, o.ts open_ts from sent_2853 s left join open_2853 o on s.user_id=o.user_id where o.ts is not null")
+
+sent_open_table_2853<-sqldf("select user_id,sent_ts,min(open_ts) open_ts from sent_open_join_2853 group by user_id order by open_ts")
+
+open_rate_2853<-matrix(NA, ncol=7, nrow=1)
+for (i in 1:7){
+  day_seconds<-86400*i
+  nums_open_2853<-sent_open_table_2853%>%filter(open_ts-sent_ts<=day_seconds)
+  open_rate_2853[,i]<-nrow(nums_open_2853)/nrow(sent_2853)
+  
+}
+open_rate_2853
+```
+
+```{r}
+nl_id_2873 <- ns_data_new[which(ns_data_new$nl_id==2873),] 
+sent_2873<- sqldf("select * from nl_id_2873 where event_type='nlsent' order by user_id")
+open_2873<- sqldf("select * from nl_id_2873 where event_type='nlpv' order by user_id")
+
+sent_open_join_2873<-sqldf("select s.user_id, s.ts sent_ts, o.ts open_ts from sent_2873 s left join open_2873 o on s.user_id=o.user_id where o.ts is not null")
+
+sent_open_table_2873<-sqldf("select user_id,sent_ts,min(open_ts) open_ts from sent_open_join_2873 group by user_id order by open_ts")
+
+open_rate_2873<-matrix(NA, ncol=7, nrow=1)
+for (i in 1:7){
+  day_seconds<-86400*i
+  nums_open_2873<-sent_open_table_2873%>%filter(open_ts-sent_ts<=day_seconds)
+  open_rate_2873[,i]<-nrow(nums_open_2873)/nrow(sent_2873)
+  
+}
+open_rate_2873
+```
+
+```{r}
+open_rate<-as.data.frame(cbind(t(open_rate_2885),t(open_rate_2912),t(open_rate_2853),t(open_rate_2873)))
+colnames(open_rate)<-c("nl_id_2885","nl_id_2912","nl_id_2853","nl_id_2873")
+head(open_rate)
+#open_rate_file<-write.csv(open_rate,"open_rate_file.csv")
+```
+
+```{r}
+open_rate_1<-as.data.frame(rbind(t(open_rate_2885),t(open_rate_2912),t(open_rate_2853),t(open_rate_2873)))
+open_rate_1$newsletter<-c(rep("nl_id_2885",7),rep("nl_id_2912",7),rep("nl_id_2853",7),rep("nl_id_2873",7))
+open_rate_1$day<-rep(c(1:7),4)
+head(open_rate_1)
+#open_rate1_file<-write.csv(open_rate_1,"open_rate1_file.csv")
+# this file is easier to plot
+```
+```{r}
+library(ggplot2)
+ggplot(data = open_rate_1, aes(x=day, y=V1)) + geom_line(aes(colour=newsletter))+geom_point()
+```
+
+## 3.	Make a graph of the CTRs by link position for nl_id 2873 and 2885. Visualize the results for each newsletter.
+
+Define CTR= # clicks at a position / # opens. 
+
+Example:
+
+User 1: opened once, clicked on position 1 and 3
+
+User 2: opened twice, clicked once on position 1
+
+User 3: didn’t open
+
+Based on these 3 users, 
+
+CTR_position_1 = 2/3, CTR_position_2 = 0, CTR_position_3 = 1/3 
+
+```{r}
+viewed_2873 <- nl_id_2873[which(nl_id_2873$event_type=="nlpv"),] 
+clicked_2873 <- nl_id_2873[which(nl_id_2873$event_type=="nllc"),] 
+clicked_2873$event_type_param<-as.factor(clicked_2873$event_type_param)
+
+click_at_positions_2873<-summary(clicked_2873$event_type_param)
+
+n_2873<-nrow(viewed_2873)
+#n_2873
+
+CTR_2873 <- click_at_positions_2873/n_2873; CTR_2873
+```
+
+```{r}
+viewed_2885 <- nl_id_2885[which(nl_id_2885$event_type=="nlpv"),] 
+clicked_2885 <- nl_id_2885[which(nl_id_2885$event_type=="nllc"),] 
+clicked_2885$event_type_param<-as.factor(clicked_2885$event_type_param)
+click_at_positions_2885<-summary(clicked_2885$event_type_param)
+n_2885<-nrow(viewed_2885);
+#n_2885
+CTR_2885 <- click_at_positions_2885/n_2885; CTR_2885
+```
+
+```{r}
+CTR<-c(rep("2873",8),rep("2885",8))
+CTR<-as.data.frame(CTR) 
+colnames(CTR)<-"nl_id"
+CTR$CTR_position<-c(CTR_2873, CTR_2885)
+CTR$position<-rep(c(0:7),2);CTR
+#CTR_file<-write.csv(CTR, "CTR_file.csv")
+
+ggplot(CTR, aes(x=position, y=CTR_position, fill=nl_id)) +
+geom_bar(stat="identity", position=position_dodge())
+```
+The first sale banner in the newsletter has the best CTR.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
